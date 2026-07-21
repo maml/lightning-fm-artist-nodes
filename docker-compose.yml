@@ -1,0 +1,96 @@
+# Lightning FM — Headless Artist Nodes
+# 5 managed artists, each with their own LDK node on signet
+#
+# Usage:
+#   op run --env-file=.env.tpl -- docker compose up -d
+#   OR
+#   cp .env.example .env  # fill in mnemonics
+#   docker compose up -d
+
+x-artist-defaults: &artist-defaults
+  image: lfm-artist-node
+  restart: unless-stopped
+  environment: &artist-env
+    NETWORK: "signet"
+    ESPLORA_URL: "https://mutinynet.com/api"
+    LSP_NODE_ID: "0371d6fd7d75de2d0372d03ea00e8bacdacb50c27d0eaea0a76a0622eff1f5ef2b"
+    LSP_ADDRESS: "44.228.24.253:9735"
+    HEALTH_PORT: "8080"
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  artist-satoshi-sounds:
+    <<: *artist-defaults
+    container_name: lfm-satoshi-sounds
+    environment:
+      <<: *artist-env
+      ARTIST_NAME: "Satoshi Sounds"
+      LDK_MNEMONIC: "${SATOSHI_SOUNDS_MNEMONIC}"
+      DATA_DIR: "/data"
+    volumes:
+      - satoshi-sounds-data:/data
+    ports:
+      - "8081:8080"
+
+  artist-lightning-louise:
+    <<: *artist-defaults
+    container_name: lfm-lightning-louise
+    environment:
+      <<: *artist-env
+      ARTIST_NAME: "Lightning Louise"
+      LDK_MNEMONIC: "${LIGHTNING_LOUISE_MNEMONIC}"
+      DATA_DIR: "/data"
+    volumes:
+      - lightning-louise-data:/data
+    ports:
+      - "8082:8080"
+
+  artist-keypair:
+    <<: *artist-defaults
+    container_name: lfm-keypair
+    environment:
+      <<: *artist-env
+      ARTIST_NAME: "Keypair"
+      LDK_MNEMONIC: "${KEYPAIR_MNEMONIC}"
+      DATA_DIR: "/data"
+    volumes:
+      - keypair-data:/data
+    ports:
+      - "8083:8080"
+
+  artist-relay-operators:
+    <<: *artist-defaults
+    container_name: lfm-relay-operators
+    environment:
+      <<: *artist-env
+      ARTIST_NAME: "The Relay Operators"
+      LDK_MNEMONIC: "${RELAY_OPERATORS_MNEMONIC}"
+      DATA_DIR: "/data"
+    volumes:
+      - relay-operators-data:/data
+    ports:
+      - "8084:8080"
+
+  artist-0ggm3nt3d:
+    <<: *artist-defaults
+    container_name: lfm-0ggm3nt3d
+    environment:
+      <<: *artist-env
+      ARTIST_NAME: "0GGM3NT3D"
+      LDK_MNEMONIC: "${OGGM3NT3D_MNEMONIC}"
+      DATA_DIR: "/data"
+    volumes:
+      - 0ggm3nt3d-data:/data
+    ports:
+      - "8085:8080"
+
+volumes:
+  satoshi-sounds-data:
+  lightning-louise-data:
+  keypair-data:
+  relay-operators-data:
+  0ggm3nt3d-data:
