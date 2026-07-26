@@ -31,6 +31,11 @@ pub struct PurchaseRecord {
     pub amount_msat: u64,
     pub paid: bool,
     pub created_at: u64,
+    /// Session secret returned only to the invoice requester — lets a web
+    /// buyer (whose wallet holds the preimage) poll status and claim the
+    /// download. Absent on records from before this field existed.
+    #[serde(default)]
+    pub claim_token: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -98,6 +103,7 @@ impl Store {
         slug: &str,
         amount_msat: u64,
         created_at: u64,
+        claim_token: &str,
     ) -> Result<(), String> {
         self.state.purchases.insert(
             payment_hash.to_string(),
@@ -107,6 +113,7 @@ impl Store {
                 amount_msat,
                 paid: false,
                 created_at,
+                claim_token: Some(claim_token.to_string()),
             },
         );
         self.persist()
@@ -114,6 +121,14 @@ impl Store {
 
     pub fn get_purchase(&self, payment_hash: &str) -> Option<&PurchaseRecord> {
         self.state.purchases.get(payment_hash)
+    }
+
+    /// Look up a purchase by its claim token (web-buyer path).
+    pub fn get_purchase_by_claim(&self, claim_token: &str) -> Option<&PurchaseRecord> {
+        self.state
+            .purchases
+            .values()
+            .find(|p| p.claim_token.as_deref() == Some(claim_token))
     }
 
     /// Mark a purchase paid. Unknown hashes are fine (e.g. streaming keysends
@@ -187,7 +202,7 @@ mod tests {
         let (mut store, dir) = tmp_store();
         store.upsert_product(product("midnight")).unwrap();
         store
-            .create_purchase("aa".repeat(32).as_str(), "midnight", 5_000_000, 1000)
+            .create_purchase("aa".repeat(32).as_str(), "midnight", 5_000_000, 1000, "tok-1")
             .unwrap();
 
         assert!(!store.get_purchase(&"aa".repeat(32)).unwrap().paid);
@@ -201,6 +216,19 @@ mod tests {
     fn mark_paid_unknown_hash_is_no_match() {
         let (mut store, _dir) = tmp_store();
         assert!(!store.mark_paid("ff00").unwrap());
+    }
+
+    #[test]
+    fn purchase_found_by_claim_token() {
+        let (mut store, _dir) = tmp_store();
+        store
+            .create_purchase("bb".repeat(32).as_str(), "midnight", 5_000_000, 1000, "tok-xyz")
+            .unwrap();
+        assert_eq!(
+            store.get_purchase_by_claim("tok-xyz").unwrap().slug,
+            "midnight"
+        );
+        assert!(store.get_purchase_by_claim("tok-nope").is_none());
     }
 
     #[test]

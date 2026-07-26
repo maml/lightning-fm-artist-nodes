@@ -483,12 +483,23 @@ async fn main() {
         public_url: config.public_url.clone(),
     };
 
+    // Public sales API — browsers on lightning.fm (or any storefront) talk
+    // to this daemon directly, so cross-origin must be open. Auth is NIP-98
+    // (uploads) and preimage/claim (downloads), never cookies — permissive
+    // CORS adds no surface.
+    let cors = tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods(tower_http::cors::Any)
+        .allow_headers(tower_http::cors::Any);
+
     let gate_routes = Router::new()
         .route("/products/{slug}", put(gate::put_product).get(gate::get_product))
         .route("/products/{slug}/invoice", post(gate::post_invoice))
+        .route("/products/{slug}/status", get(gate::get_status))
         .route("/products/{slug}/download", get(gate::get_download))
         // Lossless audio artifacts run large — WAV albums can exceed 1 GB
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024))
+        .layer(cors)
         .with_state(gate_state);
 
     let app = Router::new()

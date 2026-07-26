@@ -186,6 +186,16 @@ pub struct PurchaseInvoice {
     pub payment_hash: String,
     pub amount_sats: u64,
     pub expiry_secs: u32,
+    /// Session secret for the requesting buyer: polls /status and claims the
+    /// download when their wallet (not the browser) holds the preimage.
+    pub claim_token: String,
+}
+
+/// Random 32-byte hex claim token.
+fn new_claim_token() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|e| format!("RNG failure: {e}"))?;
+    Ok(hex::encode(bytes))
 }
 
 /// Validate the buyer's amount against price/floor. Pure — testable.
@@ -240,42 +250,75 @@ pub async fn post_invoice(
     };
     let invoice_desc = ldk_node::lightning_invoice::Bolt11InvoiceDescription::Direct(desc);
 
-    // JIT-capable receive first (LSP opens a channel if we lack inbound);
-    // plain receive as fallback so sales survive an unreachable LSP when
-    // inbound capacity already exists.
-    let invoice = match state.node.bolt11_payment().receive_via_jit_channel(
-        amount_msat,
-        &invoice_desc,
-        INVOICE_EXPIRY_SECS,
-        None,
-    ) {
-        Ok(inv) => inv,
-        Err(jit_err) => {
-            warn!(error = ?jit_err, "JIT invoice failed; falling back to plain receive");
-            match state
-                .node
-                .bolt11_payment()
-                .receive(amount_msat, &invoice_desc, INVOICE_EXPIRY_SECS)
-            {
-                Ok(inv) => inv,
-                Err(e) => {
-                    return err(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to create invoice: {e:?}"),
-                    )
+    // JIT only when inbound capacity can't hold the payment. With a usable
+    // channel that fits, a plain invoice routes over it with no LSP fee skim
+    // — always requesting JIT breaks repeat purchases: the LSP may forward
+    // the skimmed HTLC over the existing channel, and the node rejects it
+    // ("sent less than we were supposed to receive") because the skim was
+    // registered against the new-channel flow.
+    let inbound_msat: u64 = state
+        .node
+        .list_channels()
+        .iter()
+        .filter(|c| c.is_usable)
+        .map(|c| c.inbound_capacity_msat)
+        .sum();
+
+    let invoice = if inbound_msat >= amount_msat {
+        match state
+            .node
+            .bolt11_payment()
+            .receive(amount_msat, &invoice_desc, INVOICE_EXPIRY_SECS)
+        {
+            Ok(inv) => inv,
+            Err(e) => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to create invoice: {e:?}"),
+                )
+            }
+        }
+    } else {
+        match state.node.bolt11_payment().receive_via_jit_channel(
+            amount_msat,
+            &invoice_desc,
+            INVOICE_EXPIRY_SECS,
+            None,
+        ) {
+            Ok(inv) => inv,
+            Err(jit_err) => {
+                warn!(error = ?jit_err, "JIT invoice failed; falling back to plain receive");
+                match state
+                    .node
+                    .bolt11_payment()
+                    .receive(amount_msat, &invoice_desc, INVOICE_EXPIRY_SECS)
+                {
+                    Ok(inv) => inv,
+                    Err(e) => {
+                        return err(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to create invoice: {e:?}"),
+                        )
+                    }
                 }
             }
         }
     };
 
     let payment_hash = invoice.payment_hash().to_string();
+    let claim_token = match new_claim_token() {
+        Ok(t) => t,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
 
     {
         let mut store = match state.store.lock() {
             Ok(s) => s,
             Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "Store lock poisoned"),
         };
-        if let Err(e) = store.create_purchase(&payment_hash, &slug, amount_msat, now_secs()) {
+        if let Err(e) =
+            store.create_purchase(&payment_hash, &slug, amount_msat, now_secs(), &claim_token)
+        {
             return err(StatusCode::INTERNAL_SERVER_ERROR, e);
         }
     }
@@ -286,15 +329,57 @@ pub async fn post_invoice(
         payment_hash,
         amount_sats,
         expiry_secs: INVOICE_EXPIRY_SECS,
+        claim_token,
     })
     .into_response()
 }
 
-// ─── Download (buyer, preimage-authenticated) ────────────────
+// ─── Status (buyer polling) ──────────────────────────────────
 
 #[derive(Deserialize)]
+pub struct StatusParams {
+    pub claim: String,
+}
+
+pub async fn get_status(
+    AxumState(state): AxumState<GateState>,
+    AxumPath(slug): AxumPath<String>,
+    Query(params): Query<StatusParams>,
+) -> Response {
+    let (paid, payment_hash) = {
+        let store = match state.store.lock() {
+            Ok(s) => s,
+            Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "Store lock poisoned"),
+        };
+        match store.get_purchase_by_claim(&params.claim) {
+            Some(p) if p.slug == slug => (p.paid, p.payment_hash.clone()),
+            _ => return err(StatusCode::NOT_FOUND, "No purchase for this claim"),
+        }
+    };
+
+    // Same node-store fallback as download — covers restarts and races.
+    let paid = if paid {
+        true
+    } else if settled_on_node(&state.node, &payment_hash) {
+        if let Ok(mut store) = state.store.lock() {
+            let _ = store.mark_paid(&payment_hash);
+        }
+        true
+    } else {
+        false
+    };
+
+    Json(serde_json::json!({ "paid": paid })).into_response()
+}
+
+// ─── Download (buyer, preimage-authenticated) ────────────────
+
+#[derive(Deserialize, Default)]
 pub struct DownloadParams {
-    pub preimage: String,
+    /// Cryptographic receipt: sha256(preimage) must equal the payment hash.
+    pub preimage: Option<String>,
+    /// Session credential from invoice issuance (web-buyer path).
+    pub claim: Option<String>,
 }
 
 /// Check the node's payment store for a settled inbound payment with this hash.
@@ -315,11 +400,31 @@ pub async fn get_download(
     AxumPath(slug): AxumPath<String>,
     Query(params): Query<DownloadParams>,
 ) -> Response {
-    let preimage_bytes = match hex::decode(params.preimage.trim()) {
-        Ok(b) if b.len() == 32 => b,
-        _ => return err(StatusCode::BAD_REQUEST, "Preimage must be 32 bytes of hex"),
+    // Resolve the payment hash from whichever credential was presented.
+    // The preimage is the cryptographic receipt; the claim token is the
+    // session credential handed out at invoice time.
+    let payment_hash = match (&params.preimage, &params.claim) {
+        (Some(preimage), _) => {
+            let preimage_bytes = match hex::decode(preimage.trim()) {
+                Ok(b) if b.len() == 32 => b,
+                _ => return err(StatusCode::BAD_REQUEST, "Preimage must be 32 bytes of hex"),
+            };
+            hex::encode(Sha256::digest(&preimage_bytes))
+        }
+        (None, Some(claim)) => {
+            let store = match state.store.lock() {
+                Ok(s) => s,
+                Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "Store lock poisoned"),
+            };
+            match store.get_purchase_by_claim(claim) {
+                Some(p) => p.payment_hash.clone(),
+                None => return err(StatusCode::NOT_FOUND, "No purchase for this claim"),
+            }
+        }
+        (None, None) => {
+            return err(StatusCode::BAD_REQUEST, "Provide a preimage or claim token")
+        }
     };
-    let payment_hash = hex::encode(Sha256::digest(&preimage_bytes));
 
     // Purchase must exist for this product and hash
     let (paid, file_name, format, size_bytes) = {
