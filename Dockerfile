@@ -14,9 +14,13 @@ RUN mkdir src && echo "fn main(){}" > src/main.rs && \
     cargo build --release 2>/dev/null || true && \
     rm -rf src
 
-# Build actual binary
+# Build actual binary. cargo clean forces a rebuild of only this crate:
+# Docker's COPY sets src/ mtimes older than the stub's target/ artifacts, so
+# without it cargo skips recompilation and ships the fn main(){} stub.
+# --release on the clean is load-bearing — profile-less clean -p only touches
+# dev artifacts and leaves the release-profile stub in place.
 COPY src/ ./src/
-RUN cargo build --release
+RUN cargo clean --release -p lfm-artist-node && cargo build --release
 
 # Production image
 FROM debian:bookworm-slim

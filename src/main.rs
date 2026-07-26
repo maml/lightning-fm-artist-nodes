@@ -267,6 +267,7 @@ async fn run_event_loop(node: Arc<Node>, artist_name: String, store: Arc<Mutex<S
 struct AppState {
     node: Arc<Node>,
     artist_name: String,
+    network: Network,
 }
 
 #[derive(Serialize)]
@@ -311,7 +312,7 @@ async fn health(AxumState(state): AxumState<AppState>) -> Json<HealthResponse> {
         status: "ok".to_string(),
         artist: state.artist_name.clone(),
         node_id,
-        network: "signet".to_string(),
+        network: state.network.to_string(),
         channels,
         peers,
     })
@@ -386,7 +387,7 @@ async fn main() {
 
     info!(
         artist = %config.artist_name,
-        network = "signet",
+        network = ?config.network,
         data_dir = %config.data_dir,
         "Starting headless artist node"
     );
@@ -471,6 +472,7 @@ async fn main() {
     let app_state = AppState {
         node: node.clone(),
         artist_name: config.artist_name.clone(),
+        network: config.network,
     };
 
     let gate_state = gate::GateState {
