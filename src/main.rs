@@ -6,18 +6,25 @@
 // Usage:
 //   LDK_MNEMONIC="abandon ... about" ARTIST_NAME="Satoshi Sounds" lfm-artist-node
 
+mod gate;
+mod nip98;
+mod store;
+
 use ldk_node::bip39::Mnemonic;
 use ldk_node::bitcoin::Network;
 use ldk_node::lightning::ln::msgs::SocketAddress;
 use ldk_node::{Builder, Event, Node};
 
-use axum::{extract::State as AxumState, extract::Query, routing::get, Json, Router};
+use axum::extract::DefaultBodyLimit;
+use axum::{extract::State as AxumState, extract::Query, routing::{get, post, put}, Json, Router};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::signal;
 use tracing::{error, info, warn};
+
+use store::Store;
 
 // ---------------------------------------------------------------------------
 // Config from environment
@@ -29,11 +36,18 @@ struct Config {
     network: Network,
     data_dir: String,
     esplora_url: String,
+    /// http://user:pass@host:port — when set, used as the chain source
+    /// instead of Esplora (regtest dev-cluster path).
+    bitcoind_rpc_url: Option<String>,
     rgs_url: Option<String>,
     lsp_node_id: String,
     lsp_address: String,
     lsp_token: Option<String>,
     health_port: u16,
+    /// Hex pubkey allowed to upload product artifacts (NIP-98 signer).
+    artist_pubkey: Option<String>,
+    /// External base URL of this daemon, for NIP-98 URL verification.
+    public_url: String,
 }
 
 impl Config {
@@ -45,24 +59,54 @@ impl Config {
         let mnemonic: Mnemonic = mnemonic_str.parse()
             .map_err(|e| format!("Invalid mnemonic: {e}"))?;
 
+        let network = match std::env::var("NETWORK").ok().as_deref() {
+            Some("regtest") => Network::Regtest,
+            Some("testnet") => Network::Testnet,
+            Some("bitcoin") | Some("mainnet") => Network::Bitcoin,
+            _ => Network::Signet,
+        };
+
+        let health_port = std::env::var("HEALTH_PORT")
+            .unwrap_or_else(|_| "8080".to_string())
+            .parse().unwrap_or(8080);
+
         Ok(Config {
             artist_name: std::env::var("ARTIST_NAME").unwrap_or_else(|_| "Unknown Artist".to_string()),
             mnemonic,
-            network: Network::Signet,
+            network,
             data_dir: std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".to_string()),
             esplora_url: std::env::var("ESPLORA_URL")
                 .unwrap_or_else(|_| "https://mutinynet.com/api".to_string()),
+            bitcoind_rpc_url: std::env::var("BITCOIND_RPC_URL").ok(),
             rgs_url: std::env::var("RGS_URL").ok(),
             lsp_node_id: std::env::var("LSP_NODE_ID").unwrap_or_else(|_|
                 "0371d6fd7d75de2d0372d03ea00e8bacdacb50c27d0eaea0a76a0622eff1f5ef2b".to_string()),
             lsp_address: std::env::var("LSP_ADDRESS")
                 .unwrap_or_else(|_| "44.228.24.253:9735".to_string()),
             lsp_token: std::env::var("LSP_TOKEN").ok(),
-            health_port: std::env::var("HEALTH_PORT")
-                .unwrap_or_else(|_| "8080".to_string())
-                .parse().unwrap_or(8080),
+            health_port,
+            artist_pubkey: std::env::var("ARTIST_PUBKEY").ok(),
+            public_url: std::env::var("PUBLIC_URL")
+                .unwrap_or_else(|_| format!("http://localhost:{}", health_port)),
         })
     }
+}
+
+/// Parse http://user:pass@host:port into (host, port, user, pass).
+fn parse_bitcoind_rpc(url: &str) -> Result<(String, u16, String, String), String> {
+    let without_scheme = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .ok_or("BITCOIND_RPC_URL must start with http(s)://")?;
+    let (creds, host_port) = without_scheme.split_once('@')
+        .ok_or("BITCOIND_RPC_URL missing user:pass@")?;
+    let (user, pass) = creds.split_once(':')
+        .ok_or("BITCOIND_RPC_URL missing user:pass")?;
+    let (host, port_str) = host_port.split_once(':')
+        .ok_or("BITCOIND_RPC_URL missing host:port")?;
+    let port: u16 = port_str.parse()
+        .map_err(|_| "BITCOIND_RPC_URL has an invalid port")?;
+    Ok((host.to_string(), port, user.to_string(), pass.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -75,7 +119,16 @@ fn build_node(config: &Config) -> Result<Node, String> {
     builder.set_network(config.network);
     builder.set_entropy_bip39_mnemonic(config.mnemonic.clone(), None);
     builder.set_storage_dir_path(config.data_dir.clone());
-    builder.set_chain_source_esplora(config.esplora_url.clone(), None);
+
+    match config.bitcoind_rpc_url {
+        Some(ref url) => {
+            let (host, port, user, pass) = parse_bitcoind_rpc(url)?;
+            builder.set_chain_source_bitcoind_rpc(host, port, user, pass);
+        }
+        None => {
+            builder.set_chain_source_esplora(config.esplora_url.clone(), None);
+        }
+    }
 
     if let Some(ref rgs_url) = config.rgs_url {
         builder.set_gossip_source_rgs(rgs_url.clone());
@@ -101,7 +154,7 @@ fn build_node(config: &Config) -> Result<Node, String> {
 // Event loop
 // ---------------------------------------------------------------------------
 
-async fn run_event_loop(node: Arc<Node>, artist_name: String) {
+async fn run_event_loop(node: Arc<Node>, artist_name: String, store: Arc<Mutex<Store>>) {
     info!("Event loop started for {}", artist_name);
 
     loop {
@@ -122,6 +175,17 @@ async fn run_event_loop(node: Arc<Node>, artist_name: String) {
                     payment_hash = %payment_hash,
                     "Payment received"
                 );
+
+                // Settle any pending purchase carrying this hash — the
+                // streaming keysend path shares this node, so misses are fine.
+                match store.lock() {
+                    Ok(mut s) => match s.mark_paid(&payment_hash.to_string()) {
+                        Ok(true) => info!(payment_hash = %payment_hash, "Purchase settled"),
+                        Ok(false) => {}
+                        Err(e) => error!(error = %e, "Failed to persist purchase settlement"),
+                    },
+                    Err(_) => error!("Store lock poisoned in event loop"),
+                }
 
                 // Log custom TLV records (track_id, listener_pubkey, timestamp)
                 for record in custom_records.iter() {
@@ -371,11 +435,36 @@ async fn main() {
 
     let node = Arc::new(node);
 
+    // Product store (registry + purchase ledger)
+    let store = match Store::open(&config.data_dir) {
+        Ok(s) => Arc::new(Mutex::new(s)),
+        Err(e) => {
+            error!("Failed to open product store: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Artist pubkey for NIP-98 upload auth (uploads disabled when unset)
+    let artist_pubkey = match config.artist_pubkey.as_deref() {
+        Some(hex) => match hex.parse::<nostr::PublicKey>() {
+            Ok(pk) => Some(pk),
+            Err(e) => {
+                error!("Invalid ARTIST_PUBKEY: {}", e);
+                std::process::exit(1);
+            }
+        },
+        None => {
+            warn!("ARTIST_PUBKEY not set — product uploads disabled");
+            None
+        }
+    };
+
     // Start event loop
     let event_node = node.clone();
     let event_artist = config.artist_name.clone();
+    let event_store = store.clone();
     let event_handle = tokio::spawn(async move {
-        run_event_loop(event_node, event_artist).await;
+        run_event_loop(event_node, event_artist, event_store).await;
     });
 
     // Start HTTP management API
@@ -384,11 +473,28 @@ async fn main() {
         artist_name: config.artist_name.clone(),
     };
 
+    let gate_state = gate::GateState {
+        node: node.clone(),
+        store,
+        artist_name: config.artist_name.clone(),
+        artist_pubkey,
+        public_url: config.public_url.clone(),
+    };
+
+    let gate_routes = Router::new()
+        .route("/products/{slug}", put(gate::put_product).get(gate::get_product))
+        .route("/products/{slug}/invoice", post(gate::post_invoice))
+        .route("/products/{slug}/download", get(gate::get_download))
+        // Lossless audio artifacts run large — WAV albums can exceed 1 GB
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024))
+        .with_state(gate_state);
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/node-id", get(get_node_id))
         .route("/invoice", get(create_invoice))
-        .with_state(app_state);
+        .with_state(app_state)
+        .merge(gate_routes);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.health_port));
     info!(port = config.health_port, "HTTP management API listening");
