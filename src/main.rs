@@ -6,6 +6,7 @@
 // Usage:
 //   LDK_MNEMONIC="abandon ... about" ARTIST_NAME="Satoshi Sounds" lfm-artist-node
 
+mod admin;
 mod gate;
 mod nip98;
 mod store;
@@ -48,6 +49,11 @@ struct Config {
     artist_pubkey: Option<String>,
     /// External base URL of this daemon, for NIP-98 URL verification.
     public_url: String,
+    /// LSPS1 provider REST base (e.g. https://megalithic.me/api/lsps1/v1).
+    lsps1_api_url: Option<String>,
+    /// LSPS1 provider node URI (pubkey@host:port). Trusted for 0-conf and
+    /// connected at startup — their API requires a live P2P connection.
+    lsps1_node_uri: Option<String>,
 }
 
 impl Config {
@@ -88,6 +94,8 @@ impl Config {
             artist_pubkey: std::env::var("ARTIST_PUBKEY").ok(),
             public_url: std::env::var("PUBLIC_URL")
                 .unwrap_or_else(|_| format!("http://localhost:{}", health_port)),
+            lsps1_api_url: std::env::var("LSPS1_API_URL").ok(),
+            lsps1_node_uri: std::env::var("LSPS1_NODE_URI").ok(),
         })
     }
 }
@@ -114,7 +122,14 @@ fn parse_bitcoind_rpc(url: &str) -> Result<(String, u16, String, String), String
 // ---------------------------------------------------------------------------
 
 fn build_node(config: &Config) -> Result<Node, String> {
-    let mut builder = Builder::new();
+    // 0-conf trust: LSPS1-purchased channels open zero-conf, which LDK only
+    // accepts from explicitly trusted peers.
+    let mut ldk_config = ldk_node::config::Config::default();
+    if let Some(ref uri) = config.lsps1_node_uri {
+        let (pubkey, _) = admin::parse_node_uri(uri)?;
+        ldk_config.trusted_peers_0conf.push(pubkey);
+    }
+    let mut builder = Builder::from_config(ldk_config);
 
     builder.set_network(config.network);
     builder.set_entropy_bip39_mnemonic(config.mnemonic.clone(), None);
@@ -502,12 +517,47 @@ async fn main() {
         .layer(cors)
         .with_state(gate_state);
 
+    let admin_state = admin::AdminState {
+        node: node.clone(),
+        artist_pubkey,
+        public_url: config.public_url.clone(),
+        network: config.network,
+        lsps1_api_url: config.lsps1_api_url.clone(),
+    };
+
+    let admin_routes = Router::new()
+        .route("/admin/address", get(admin::get_address))
+        .route("/admin/balance", get(admin::get_balance))
+        .route("/admin/connect", post(admin::post_connect))
+        .route("/admin/send-onchain", post(admin::post_send_onchain))
+        .route("/admin/lsps1-order", post(admin::post_lsps1_order))
+        .route("/admin/lsps1-order/{order_id}", get(admin::get_lsps1_order))
+        .with_state(admin_state);
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/node-id", get(get_node_id))
         .route("/invoice", get(create_invoice))
         .with_state(app_state)
-        .merge(gate_routes);
+        .merge(gate_routes)
+        .merge(admin_routes);
+
+    // Connect to the LSPS1 provider — their order API requires a live P2P
+    // connection from the client node. Non-fatal: orders just fail until
+    // connectivity succeeds (retry via POST /admin/connect).
+    if let Some(ref uri) = config.lsps1_node_uri {
+        match admin::parse_node_uri(uri) {
+            Ok((pubkey, address)) => {
+                let n = node.clone();
+                let uri_log = uri.clone();
+                tokio::task::spawn_blocking(move || match n.connect(pubkey, address, true) {
+                    Ok(()) => info!(uri = %uri_log, "Connected to LSPS1 provider"),
+                    Err(e) => warn!(uri = %uri_log, error = %e, "LSPS1 provider connect failed"),
+                });
+            }
+            Err(e) => warn!(error = %e, "Invalid LSPS1_NODE_URI"),
+        }
+    }
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.health_port));
     info!(port = config.health_port, "HTTP management API listening");
