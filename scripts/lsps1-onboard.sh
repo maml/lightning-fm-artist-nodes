@@ -12,7 +12,8 @@
 # Env:
 #   DAEMON_URL       daemon base (default http://localhost:8080; must match
 #                    the daemon's PUBLIC_URL for NIP-98)
-#   ARTIST_SECRET    hex Nostr secret matching the daemon's ARTIST_PUBKEY
+#   ARTIST_SECRET    hex Nostr secret matching the daemon's ADMIN_PUBKEY
+#                    (the operator key — not the artist's publishing key)
 #   LSP_BALANCE_SAT  inbound capacity to buy (default 500000)
 #   LSPS1_NODE_URI   provider node URI — connect step (skipped if unset;
 #                    the daemon may have auto-connected at startup)

@@ -25,7 +25,10 @@ use tracing::info;
 #[derive(Clone)]
 pub struct AdminState {
     pub node: Arc<Node>,
-    pub artist_pubkey: Option<PublicKey>,
+    /// Operator key authorized for admin actions (balance, on-chain spends,
+    /// LSPS1 orders). Deliberately separate from the artist's Nostr
+    /// publishing identity — signing music must not authorize spending.
+    pub admin_pubkey: Option<PublicKey>,
     pub public_url: String,
     pub network: ldk_node::bitcoin::Network,
     /// LSPS1 REST base, e.g. https://megalithic.me/api/lsps1/v1
@@ -52,10 +55,10 @@ fn authorize(
     path: &str,
     body: Option<&[u8]>,
 ) -> Result<(), Response> {
-    let Some(ref artist_pk) = state.artist_pubkey else {
+    let Some(ref admin_pk) = state.admin_pubkey else {
         return Err(err(
             StatusCode::SERVICE_UNAVAILABLE,
-            "Admin API disabled: ARTIST_PUBKEY not configured",
+            "Admin API disabled: ADMIN_PUBKEY not configured",
         ));
     };
     let Some(auth) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else {
@@ -63,7 +66,7 @@ fn authorize(
     };
     let url = format!("{}{}", state.public_url.trim_end_matches('/'), path);
     let body_hash = body.map(|b| hex::encode(Sha256::digest(b)));
-    crate::nip98::verify(auth, method, &url, body_hash.as_deref(), artist_pk, now_secs())
+    crate::nip98::verify(auth, method, &url, body_hash.as_deref(), admin_pk, now_secs())
         .map(|_| ())
         .map_err(|e| err(StatusCode::UNAUTHORIZED, format!("NIP-98: {e}")))
 }

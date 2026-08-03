@@ -47,6 +47,7 @@ struct Config {
     health_port: u16,
     /// Hex pubkey allowed to upload product artifacts (NIP-98 signer).
     artist_pubkey: Option<String>,
+    admin_pubkey: Option<String>,
     /// External base URL of this daemon, for NIP-98 URL verification.
     public_url: String,
     /// LSPS1 provider REST base (e.g. https://megalithic.me/api/lsps1/v1).
@@ -92,6 +93,8 @@ impl Config {
             lsp_token: std::env::var("LSP_TOKEN").ok(),
             health_port,
             artist_pubkey: std::env::var("ARTIST_PUBKEY").ok(),
+            admin_pubkey: std::env::var("ADMIN_PUBKEY").ok()
+                .or_else(|| std::env::var("ARTIST_PUBKEY").ok()),
             public_url: std::env::var("PUBLIC_URL")
                 .unwrap_or_else(|_| format!("http://localhost:{}", health_port)),
             lsps1_api_url: std::env::var("LSPS1_API_URL").ok(),
@@ -475,6 +478,29 @@ async fn main() {
         }
     };
 
+    // Operator key for the admin API. Separate from the artist's publishing
+    // identity so a compromised music-signing key cannot move funds; falls
+    // back to ARTIST_PUBKEY when unset so older deployments keep working.
+    let admin_pubkey = match config.admin_pubkey.as_deref() {
+        Some(hex) => match hex.parse::<nostr::PublicKey>() {
+            Ok(pk) => Some(pk),
+            Err(e) => {
+                error!("Invalid ADMIN_PUBKEY: {}", e);
+                std::process::exit(1);
+            }
+        },
+        None => {
+            warn!("ADMIN_PUBKEY not set — admin API disabled");
+            None
+        }
+    };
+    if admin_pubkey.is_some() && admin_pubkey == artist_pubkey {
+        warn!(
+            "ADMIN_PUBKEY equals ARTIST_PUBKEY — the key that signs music can \
+             also authorize on-chain spends. Set a distinct ADMIN_PUBKEY."
+        );
+    }
+
     // Start event loop
     let event_node = node.clone();
     let event_artist = config.artist_name.clone();
@@ -519,7 +545,7 @@ async fn main() {
 
     let admin_state = admin::AdminState {
         node: node.clone(),
-        artist_pubkey,
+        admin_pubkey,
         public_url: config.public_url.clone(),
         network: config.network,
         lsps1_api_url: config.lsps1_api_url.clone(),
