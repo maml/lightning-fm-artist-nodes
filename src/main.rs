@@ -8,6 +8,7 @@
 
 mod admin;
 mod gate;
+mod lnurl;
 mod nip98;
 mod store;
 
@@ -48,6 +49,8 @@ struct Config {
     /// Hex pubkey allowed to upload product artifacts (NIP-98 signer).
     artist_pubkey: Option<String>,
     admin_pubkey: Option<String>,
+    /// Lightning address this node answers LNURL-pay for.
+    lnurl_address: String,
     /// External base URL of this daemon, for NIP-98 URL verification.
     public_url: String,
     /// LSPS1 provider REST base (e.g. https://megalithic.me/api/lsps1/v1).
@@ -77,8 +80,13 @@ impl Config {
             .unwrap_or_else(|_| "8080".to_string())
             .parse().unwrap_or(8080);
 
+        let artist_name =
+            std::env::var("ARTIST_NAME").unwrap_or_else(|_| "Unknown Artist".to_string());
+        let public_url = std::env::var("PUBLIC_URL")
+            .unwrap_or_else(|_| format!("http://localhost:{}", health_port));
+
         Ok(Config {
-            artist_name: std::env::var("ARTIST_NAME").unwrap_or_else(|_| "Unknown Artist".to_string()),
+            artist_name: artist_name.clone(),
             mnemonic,
             network,
             data_dir: std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".to_string()),
@@ -95,12 +103,38 @@ impl Config {
             artist_pubkey: std::env::var("ARTIST_PUBKEY").ok(),
             admin_pubkey: std::env::var("ADMIN_PUBKEY").ok()
                 .or_else(|| std::env::var("ARTIST_PUBKEY").ok()),
-            public_url: std::env::var("PUBLIC_URL")
-                .unwrap_or_else(|_| format!("http://localhost:{}", health_port)),
+            public_url: public_url.clone(),
+            // Defaults to <slugified artist>@<this node's own host>, so the
+            // artist's Lightning address points at their own hardware rather
+            // than any platform. Override with LNURL_ADDRESS.
+            lnurl_address: std::env::var("LNURL_ADDRESS").unwrap_or_else(|_| {
+                let host = public_url
+                    .split("://")
+                    .nth(1)
+                    .unwrap_or("localhost")
+                    .split('/')
+                    .next()
+                    .unwrap_or("localhost")
+                    .split(':')
+                    .next()
+                    .unwrap_or("localhost");
+                format!("{}@{}", slugify(&artist_name), host)
+            }),
             lsps1_api_url: std::env::var("LSPS1_API_URL").ok(),
             lsps1_node_uri: std::env::var("LSPS1_NODE_URI").ok(),
         })
     }
+}
+
+/// Lowercase alphanumerics, everything else collapsed to nothing — good
+/// enough for the local part of a Lightning address.
+fn slugify(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_lowercase();
+    if s.is_empty() { "artist".to_string() } else { s }
 }
 
 /// Parse http://user:pass@host:port into (host, port, user, pass).
@@ -543,6 +577,25 @@ async fn main() {
         .layer(cors)
         .with_state(gate_state);
 
+    // LNURL-pay: the artist's Lightning address resolves to this node, so
+    // zaps land in the same wallet as storefront sales with nobody in between.
+    let lnurl_state = lnurl::LnurlState {
+        node: node.clone(),
+        artist_name: config.artist_name.clone(),
+        address: config.lnurl_address.clone(),
+        public_url: config.public_url.clone(),
+    };
+
+    let lnurl_routes = Router::new()
+        .route("/.well-known/lnurlp/{name}", get(lnurl::lnurlp))
+        .layer(
+            tower_http::cors::CorsLayer::new()
+                .allow_origin(tower_http::cors::Any)
+                .allow_methods(tower_http::cors::Any)
+                .allow_headers(tower_http::cors::Any),
+        )
+        .with_state(lnurl_state);
+
     let admin_state = admin::AdminState {
         node: node.clone(),
         admin_pubkey,
@@ -566,6 +619,7 @@ async fn main() {
         .route("/invoice", get(create_invoice))
         .with_state(app_state)
         .merge(gate_routes)
+        .merge(lnurl_routes)
         .merge(admin_routes);
 
     // Connect to the LSPS1 provider — their order API requires a live P2P
