@@ -156,11 +156,14 @@ pub fn valid_slug(slug: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// Validate an artifact format extension ("flac", "wav", ...).
+/// Validate an artifact format extension ("flac", "wav", ...). Kept in
+/// lockstep with the hosted gate's FORMATS set (marketing site,
+/// api/gate/products/[slug]/route.ts) — the two sellers must not disagree
+/// about what is sellable. "zip" covers stems bundles.
 pub fn valid_format(format: &str) -> bool {
     matches!(
         format,
-        "flac" | "wav" | "aiff" | "alac" | "mp3" | "ogg" | "m4a" | "aac" | "opus"
+        "flac" | "wav" | "aiff" | "alac" | "mp3" | "ogg" | "m4a" | "aac" | "opus" | "zip"
     )
 }
 
@@ -243,6 +246,7 @@ mod tests {
     #[test]
     fn format_validation() {
         assert!(valid_format("flac"));
+        assert!(valid_format("zip"));
         assert!(!valid_format("exe"));
         assert!(!valid_format(""));
     }
