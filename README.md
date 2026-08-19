@@ -35,7 +35,7 @@ Each artist gets an isolated node, wallet, and product store. Mnemonics come in 
 
 ## About the launch catalog
 
-The example artist names in `.env.example` and the compose file are Lightning FM's original house-produced test artists, used to exercise these rails end to end before real artists onboarded. They have since been retired to a private test network. We say this plainly rather than have you find it in the history; see the [desktop app README](https://github.com/maml/lightning-fm-desktop#about-the-launch-catalog) for the fuller note.
+The example artist names in `.env.example` and the compose file are Lightning FM's original house-produced test artists, used to exercise these rails end to end before real artists onboarded. They have since been retired to a private test network. We say this plainly rather than have you find it in the history; see the [desktop app README](https://github.com/Lightning-FM/lightning-fm-desktop#about-the-launch-catalog) for the fuller note.
 
 ## License
 
