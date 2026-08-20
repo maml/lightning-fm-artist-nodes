@@ -1,5 +1,8 @@
-# Lightning FM — Headless Artist Nodes
-# 5 managed artists, each with their own LDK node on signet
+# Lightning FM :: Headless Artist Nodes :: DEV FLEET (signet)
+# 5 test artists, each with their own LDK node on signet. Not a production
+# shape. For a real single-artist deployment use install.sh (systemd) or
+# docker-compose.prod.yml. The artist names are the retired launch catalog;
+# see README "About the launch catalog".
 #
 # Usage:
 #   op run --env-file=.env.tpl -- docker compose up -d

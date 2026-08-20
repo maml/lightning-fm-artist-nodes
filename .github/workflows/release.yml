@@ -1,0 +1,80 @@
+# Lightning FM :: artist node release builds
+#
+# On tag push (v*), builds Linux x86_64 and aarch64 binaries and attaches
+# them to a GitHub release. The aarch64 build is the whole point: compiling
+# on a Pi 4 takes about 42 minutes, and install.sh downloads these instead.
+#
+# Runners are pinned to Ubuntu 22.04 (glibc 2.35) so the binaries run on
+# Debian 12 bookworm (glibc 2.36, i.e. Raspberry Pi OS 64-bit) and on
+# Ubuntu 22.04+. Building on 24.04 would silently require glibc 2.39 and
+# break every bookworm Pi. The native arm64 runner avoids cross-compiling
+# OpenSSL, which reqwest links.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Run tests
+        run: cargo test --release --locked
+
+      - name: Package
+        run: |
+          NAME="lfm-artist-node-${GITHUB_REF_NAME}-linux-${{ matrix.arch }}"
+          mkdir -p dist
+          cp target/release/lfm-artist-node dist/
+          tar -czf "${NAME}.tar.gz" -C dist lfm-artist-node
+          sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.arch }}
+          path: |
+            *.tar.gz
+            *.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create release and attach binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.tar.gz
+            *.tar.gz.sha256
+          generate_release_notes: true

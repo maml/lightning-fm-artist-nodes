@@ -1,0 +1,43 @@
+# Lightning FM :: artist node systemd unit
+# Installed to /etc/systemd/system/lfm-artist-node.service by install.sh.
+
+[Unit]
+Description=Lightning FM artist node (headless LDK node + storefront API)
+Documentation=https://github.com/Lightning-FM/lightning-fm-artist-nodes
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=lfm-artist
+Group=lfm-artist
+
+# All 12 config vars live here (root:root, mode 600 -- it holds the seed).
+# systemd reads this file as root before dropping to the service user.
+EnvironmentFile=/etc/lfm-artist-node.env
+
+# The unit owns the data directory; DATA_DIR is deliberately NOT in the env
+# file so nobody points two units at the same wallet state by accident.
+Environment=DATA_DIR=/var/lib/lfm-artist-node
+
+ExecStart=/usr/local/bin/lfm-artist-node
+Restart=on-failure
+RestartSec=10
+
+# systemd creates and owns /var/lib/lfm-artist-node.
+# StateDirectoryMode MUST stay explicit: without it systemd resets the
+# directory to 0755 on every start, and this directory holds the wallet
+# and channel state. Keep it 0700.
+StateDirectory=lfm-artist-node
+StateDirectoryMode=0700
+
+# Hardening. StateDirectory grants the only write path we need.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

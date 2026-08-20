@@ -1,0 +1,41 @@
+# Lightning FM :: single-artist production compose example
+#
+# One artist, one node, mainnet. Prefer the systemd install (install.sh)
+# on a Pi or VPS; use this shape only if your box is already compose-managed.
+#
+# Usage:
+#   cp deploy/lfm-artist-node.env.example .env.prod   # fill in all 12 vars
+#   docker compose -f docker-compose.prod.yml up -d --build
+#   curl http://localhost:8090/health
+#
+# The container listens on 8080 internally; the host publishes 8090 to
+# match the packaged default (lnd's REST port squats 8080 on most node
+# boxes; see README "Ports"). Point your tunnel or proxy at host 8090.
+#
+# The dev fleet lives in docker-compose.yml (signet, five test artists).
+
+services:
+  artist-node:
+    build: .
+    image: lfm-artist-node
+    container_name: lfm-artist-node
+    restart: unless-stopped
+    env_file:
+      - .env.prod
+    environment:
+      # Container-internal values; everything artist-specific comes
+      # from .env.prod (NETWORK=bitcoin, mnemonic, keys, URLs).
+      DATA_DIR: "/data"
+      HEALTH_PORT: "8080"
+    volumes:
+      - artist-data:/data
+    ports:
+      - "8090:8080"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  artist-data:
